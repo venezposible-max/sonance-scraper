@@ -65,11 +65,12 @@ app.get('/extract', async (req, res) => {
         embedUrl = `https://vsembed.ru/embed/movie/${id}?autoplay=1`;
     }
 
-    // Lista de fuentes alternativas (si vsembed falla)
+    // Sources ordered by reliability for headless extraction
     const sources = [
-        embedUrl,
+        `https://vidsrc.me/embed/movie?tmdb=${id}`,
         `https://vidsrc.xyz/embed/movie?tmdb=${id}`,
-        `https://www.2embed.cc/embed/${id}`
+        `https://multiembed.mov/?video_id=${id}&tmdb=1`,
+        `https://vsembed.ru/embed/movie/${id}?autoplay=1`
     ];
 
     for (const sourceUrl of sources) {
@@ -83,18 +84,33 @@ app.get('/extract', async (req, res) => {
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
                     '--disable-accelerated-2d-canvas',
                     '--no-first-run',
                     '--no-zygote',
                     '--disable-gpu',
                     '--disable-web-security',
-                    '--autoplay-policy=no-user-gesture-required'
+                    '--autoplay-policy=no-user-gesture-required',
+                    '--window-size=1920,1080'
                 ]
             });
 
             const context = await browser.newContext({
                 userAgent: 'Mozilla/5.0 (Linux; Android 10; BRAVIA 4K; Build/PPR1.180610.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Safari/537.36',
-                viewport: { width: 1920, height: 1080 }
+                viewport: { width: 1920, height: 1080 },
+                // Eliminar huellas de automatización
+                javaScriptEnabled: true,
+                extraHTTPHeaders: {
+                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+                }
+            });
+
+            // Eliminar navigator.webdriver que delata al bot
+            await context.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
             });
 
             const page = await context.newPage();
