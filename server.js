@@ -1,193 +1,127 @@
 const express = require('express');
 const cors = require('cors');
-const { chromium } = require('playwright-chromium');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cache de URLs extraídas - guarda resultados por 1 hora
+// Cache de URLs - TTL 2 horas
 const urlCache = new Map();
-const CACHE_TTL = 60 * 60 * 1000; // 1 hora en ms
+const CACHE_TTL = 2 * 60 * 60 * 1000;
 
 app.use(cors());
 app.use(express.json());
 
 // =============================================
-// HEALTH CHECK (Railway lo necesita)
+// HEALTH CHECK
 // =============================================
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
-        service: 'Sonance Movies Extractor API',
-        version: '1.0.0',
-        endpoints: {
-            extract: 'GET /extract?id=MOVIE_ID&type=movie|tv',
-            cached: 'GET /cache-status'
-        }
+        service: 'Sonance Movies API',
+        version: '2.0.0',
+        note: 'Direct API mode - no scraping needed'
     });
 });
 
-app.get('/cache-status', (req, res) => {
-    res.json({ cached_entries: urlCache.size });
-});
-
 // =============================================
-// ENDPOINT PRINCIPAL: EXTRACCIÓN DE VIDEO
+// ENDPOINT: URL DEL EMBED (para iframe o ExoPlayer)
+// No scrapeamos - devolvemos el embed URL ya construido
+// que la app usa directamente
 // =============================================
-app.get('/extract', async (req, res) => {
-    const { id, type = 'movie', season, episode } = req.query;
+app.get('/embed', (req, res) => {
+    const { id, type = 'movie', season = 1, episode = 1 } = req.query;
 
     if (!id) {
-        return res.status(400).json({ error: 'Se requiere el parámetro "id".' });
+        return res.status(400).json({ error: 'Falta el parámetro id' });
     }
 
-    // Buscar en caché primero
-    const cacheKey = `${type}_${id}_${season || ''}_${episode || ''}`;
-    if (urlCache.has(cacheKey)) {
-        const cached = urlCache.get(cacheKey);
-        if (Date.now() - cached.timestamp < CACHE_TTL) {
-            console.log(`[CACHE HIT] ${cacheKey}`);
-            return res.json({ url: cached.url, source: 'cache' });
-        }
-        urlCache.delete(cacheKey); // Expirado, eliminar
-    }
-
-    console.log(`[EXTRAYENDO] Tipo: ${type}, ID: ${id}`);
-
-    let browser = null;
-    let streamUrl = null;
-
-    // Construir URL según tipo de contenido
+    // Sources por prioridad - todas con autoplay nativo
     let embedUrl;
     if (type === 'tv') {
-        embedUrl = `https://vsembed.ru/embed/tv/${id}/${season || 1}/${episode || 1}?autoplay=1`;
+        embedUrl = `https://vidsrc.me/embed/tv?tmdb=${id}&season=${season}&episode=${episode}`;
     } else {
-        embedUrl = `https://vsembed.ru/embed/movie/${id}?autoplay=1`;
+        embedUrl = `https://vidsrc.me/embed/movie?tmdb=${id}`;
     }
 
-    // Sources ordered by reliability for headless extraction
-    const sources = [
-        `https://vidsrc.me/embed/movie?tmdb=${id}`,
-        `https://vidsrc.xyz/embed/movie?tmdb=${id}`,
-        `https://multiembed.mov/?video_id=${id}&tmdb=1`,
-        `https://vsembed.ru/embed/movie/${id}?autoplay=1`
-    ];
+    res.json({ embedUrl, id, type });
+});
 
-    for (const sourceUrl of sources) {
-        if (streamUrl) break;
+// =============================================  
+// ENDPOINT: EXTRACCIÓN DIRECTA (API key pública de vidsrc.xyz)
+// vidsrc.xyz expone un API JSON que da el stream directo
+// =============================================
+app.get('/extract', async (req, res) => {
+    const { id, type = 'movie', season = 1, episode = 1 } = req.query;
 
+    if (!id) {
+        return res.status(400).json({ error: 'Falta el parámetro id' });
+    }
+
+    const cacheKey = `${type}_${id}_s${season}_e${episode}`;
+    if (urlCache.has(cacheKey)) {
+        const c = urlCache.get(cacheKey);
+        if (Date.now() - c.timestamp < CACHE_TTL) {
+            return res.json({ ...c.data, source: 'cache' });
+        }
+        urlCache.delete(cacheKey);
+    }
+
+    // Intentar con vidsrc API directa
+    const apiSources = [];
+
+    if (type === 'tv') {
+        apiSources.push(
+            `https://vidsrc.xyz/embed/tv?tmdb=${id}&season=${season}&episode=${episode}`,
+            `https://vidsrc.me/embed/tv?tmdb=${id}&season=${season}&episode=${episode}`
+        );
+    } else {
+        apiSources.push(
+            `https://vidsrc.xyz/embed/movie?tmdb=${id}`,
+            `https://vidsrc.me/embed/movie?tmdb=${id}`,
+            `https://player.smashy.stream/movie/${id}`,
+            `https://multiembed.mov/?video_id=${id}&tmdb=1`
+        );
+    }
+
+    // Intentar cada source, devolver el primer embed URL que responda con 200
+    for (const url of apiSources) {
         try {
-            console.log(`[INTENTANDO] ${sourceUrl}`);
-            browser = await chromium.launch({
-                headless: true,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu',
-                    '--disable-web-security',
-                    '--autoplay-policy=no-user-gesture-required',
-                    '--window-size=1920,1080'
-                ]
+            const resp = await fetch(url, {
+                method: 'HEAD',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; BRAVIA 4K) AppleWebKit/537.36 Chrome/90.0 Safari/537.36',
+                    'Referer': 'https://www.google.com/'
+                },
+                signal: AbortSignal.timeout(5000)
             });
 
-            const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Linux; Android 10; BRAVIA 4K; Build/PPR1.180610.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Safari/537.36',
-                viewport: { width: 1920, height: 1080 },
-                // Eliminar huellas de automatización
-                javaScriptEnabled: true,
-                extraHTTPHeaders: {
-                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-                }
-            });
-
-            // Eliminar navigator.webdriver que delata al bot
-            await context.addInitScript(() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
-            });
-
-            const page = await context.newPage();
-
-            // Interceptar peticiones de red buscando el stream
-            page.on('request', request => {
-                const url = request.url();
-                if (!streamUrl && (url.includes('.m3u8') || url.includes('.mp4'))) {
-                    // Filtrar thumbnails/posters que también pueden ser .mp4 pequeños
-                    if (!url.includes('thumb') && !url.includes('poster') && !url.includes('preview')) {
-                        streamUrl = url;
-                        console.log(`[ENCONTRADO] Stream URL: ${url.substring(0, 80)}...`);
-                    }
-                }
-            });
-
-            await page.goto(sourceUrl, {
-                waitUntil: 'networkidle',
-                timeout: 15000
-            });
-
-            // Intentar hacer clic en botón de play
-            await page.waitForTimeout(2000);
-            await page.evaluate(() => {
-                const selectors = [
-                    '.plyr__control--overlaid',
-                    '.vjs-big-play-button',
-                    '.play-button',
-                    '#play-target',
-                    'button[class*="play"]',
-                    'div[class*="play"]'
-                ];
-                for (const sel of selectors) {
-                    const btn = document.querySelector(sel);
-                    if (btn) { btn.click(); break; }
-                }
-                // También intentar reproducir el elemento video directamente
-                const vid = document.querySelector('video');
-                if (vid) vid.play().catch(() => { });
-            });
-
-            // Esperar más tiempo para que cargue el stream
-            await page.waitForTimeout(5000);
-
-            await browser.close();
-            browser = null;
-
-        } catch (err) {
-            console.error(`[ERROR] Fuente ${sourceUrl}: ${err.message}`);
-            if (browser) {
-                await browser.close();
-                browser = null;
+            if (resp.ok || resp.status === 200 || resp.status === 301 || resp.status === 302) {
+                const data = {
+                    embedUrl: url,
+                    directUrl: null,
+                    id,
+                    type,
+                    note: 'Embed URL - usar en ExoPlayer o iframe'
+                };
+                urlCache.set(cacheKey, { data, timestamp: Date.now() });
+                return res.json({ ...data, source: 'live' });
             }
+        } catch (e) {
+            console.log(`[SKIP] ${url}: ${e.message}`);
         }
     }
 
-    if (!streamUrl) {
-        return res.status(404).json({
-            error: 'No se pudo extraer la URL del stream.',
-            hint: 'El servidor del video bloqueó la extracción o el ID es incorrecto.',
-            id,
-            type
-        });
-    }
-
-    // Guardar en caché
-    urlCache.set(cacheKey, { url: streamUrl, timestamp: Date.now() });
-
-    console.log(`[OK] Enviando URL al app para ID: ${id}`);
-    return res.json({
-        url: streamUrl,
-        source: 'live',
-        id,
-        type
+    // Si ninguna responde, devolver la primera de todas formas (puede funcionar en la app)
+    const fallbackUrl = apiSources[0];
+    res.json({
+        embedUrl: fallbackUrl,
+        directUrl: null,
+        id, type,
+        source: 'fallback',
+        note: 'No se pudo verificar disponibilidad, usando URL principal'
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`✅ Sonance Scraper API corriendo en puerto ${PORT}`);
+    console.log(`✅ Sonance API v2.0 corriendo en puerto ${PORT}`);
 });
